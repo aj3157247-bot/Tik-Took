@@ -1,30 +1,63 @@
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy import create_engine, Column, String, Integer, ForeignKey
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Form
+from sqlalchemy import create_engine, Column, String, Integer, ForeignKey, Text
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from pydantic import BaseModel
+import boto3
 import uuid
+import os
 
-# اتصال به دیتابیس PostgreSQL
-DATABASE_URL = "postgresql://user:password@localhost:5432/tiktok_db"
+# تنظیمات دیتابیس و S3 از طریق متغیرهای محیطی
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/tiktok_db")
+ENDPOINT_URL = os.getenv("S3_ENDPOINT", "https://storage.iran.liara.space")
+ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "YOUR_ACCESS_KEY")
+SECRET_KEY = os.getenv("S3_SECRET_KEY", "YOUR_SECRET_KEY")
+BUCKET_NAME = os.getenv("S3_BUCKET", "tik-took-videos")
+
+# ساخت اتصال دیتابیس PostgreSQL
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-class UserModel(Base):
+# مدل‌های پایگاه داده
+class UserTable(Base):
     __tablename__ = "users"
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    id = Column(String, primary_key=True)
     username = Column(String, unique=True, index=True)
+    password = Column(String)
 
-class VideoModel(Base):
+class VideoTable(Base):
     __tablename__ = "videos"
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    owner_id = Column(String, ForeignKey("users.id"))
-    video_url = Column(String)
+    id = Column(String, primary_key=True)
+    owner_username = Column(String)
+    url = Column(String)
+    caption = Column(String)
     likes_count = Column(Integer, default=0)
+
+class CommentTable(Base):
+    __tablename__ = "comments"
+    id = Column(String, primary_key=True)
+    video_id = Column(String, ForeignKey("videos.id"))
+    username = Column(String)
+    text = Column(Text)
+
+class MessageTable(Base):
+    __tablename__ = "messages"
+    id = Column(String, primary_key=True)
+    sender = Column(String)
+    receiver = Column(String)
+    text = Column(Text)
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI()
+# اتصال به S3
+s3_client = boto3.client(
+    "s3",
+    endpoint_url=ENDPOINT_URL,
+    aws_access_key_id=ACCESS_KEY,
+    aws_secret_access_key=SECRET_KEY
+)
+
+app = FastAPI(title="Tik-Took Complete Backend")
 
 def get_db():
     db = SessionLocal()
@@ -33,97 +66,42 @@ def get_db():
     finally:
         db.close()
 
-@app.post("/register")
-def register(username: str, db: Session = Depends(get_db)):
-    db_user = db.query(UserModel).filter(UserModel.username == username).first()
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status
-from pydantic import BaseModel
-from typing import List, Optional
-import boto3
-import os
-import uuid
-
-app = FastAPI(title="Tik-Took Production API")
-
-# --- تنظیمات ذخیره‌سازی ابری S3 / Liara ---
-ENDPOINT_URL = os.getenv("S3_ENDPOINT", "https://storage.iran.liara.space")
-ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "YOUR_ACCESS_KEY")
-SECRET_KEY = os.getenv("S3_SECRET_KEY", "YOUR_SECRET_KEY")
-BUCKET_NAME = os.getenv("S3_BUCKET", "tik-took-videos")
-
-s3_client = boto3.client(
-    "s3",
-    endpoint_url=ENDPOINT_URL,
-    aws_access_key_id=ACCESS_KEY,
-    aws_secret_access_key=SECRET_KEY
-)
-
-# --- مدل‌های داده (Pydantic Models) ---
-class UserRegister(BaseModel):
+# مدل‌های ورودی Pydantic
+class UserAuth(BaseModel):
     username: str
     password: str
 
-class CommentModel(BaseModel):
+class CommentCreate(BaseModel):
     video_id: str
     username: str
     text: str
 
-class MessageModel(BaseModel):
+class MessageSend(BaseModel):
     sender: str
     receiver: str
     text: str
 
-class VideoModel(BaseModel):
-    id: str
-    owner: str
-    url: str
-    caption: str
-    likes: List[str] = []
-    views: int = 0
-    score: float = 0.0
-
-# --- پایگاه داده موقت پیشرفته ---
-db_users = {}
-db_videos = {}
-db_comments = []
-db_messages = []
-
-# --- ۱. مدیریت کاربران و احراز هویت ---
 @app.post("/auth/register")
-def register(user: UserRegister):
-    if user.username in db_users:
-        raise HTTPException(status_code=400, detail="این نام کاربری قبلاً ثبت شده است")
-    user_id = str(uuid.uuid4())
-    db_users[user.username] = {
-        "id": user_id,
-        "password": user.password,
-        "followers": [],
-        "following": []
-    }
-    return {"status": "success", "user_id": user_id}
+def register(user: UserAuth, db: Session = Depends(get_db)):
+    if db.query(UserTable).filter(UserTable.username == user.username).first():
+        raise HTTPException(status_code=400, detail="نام کاربری قبلا ثبت شده است")
+    new_user = UserTable(id=str(uuid.uuid4()), username=user.username, password=user.password)
+    db.add(new_user)
+    db.commit()
+    return {"status": "success", "user_id": new_user.id}
 
-@app.post("/users/follow")
-def follow_user(follower: str, target: str):
-    if follower in db_users and target in db_users:
-        if target not in db_users[follower]["following"]:
-            db_users[follower]["following"].append(target)
-            db_users[target]["followers"].append(follower)
-            return {"status": "followed"}
-        return {"status": "already_following"}
-    raise HTTPException(status_code=404, detail="کاربر یافت نشد")
-
-# --- ۲. آپلود ویدیو به S3 و مدیریت فید (For You) ---
 @app.post("/videos/upload")
-def upload_video(owner: str, caption: str, file: UploadFile = File(...)):
-    if owner not in db_users:
-        raise HTTPException(status_code=401, detail="کاربر یافت نشد")
-
+def upload_video(
+    owner: str = Form(...),
+    caption: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
     video_id = str(uuid.uuid4())
     file_ext = file.filename.split(".")[-1]
     object_name = f"{video_id}.{file_ext}"
 
     try:
-        # آپلود مستقیم به فضای ابری S3
         s3_client.upload_fileobj(
             file.file,
             BUCKET_NAME,
@@ -131,71 +109,66 @@ def upload_video(owner: str, caption: str, file: UploadFile = File(...)):
             ExtraArgs={"ACL": "public-read"}
         )
         video_url = f"{ENDPOINT_URL}/{BUCKET_NAME}/{object_name}"
-    except Exception as e:
-        # در صورت عدم تنظیم S3، ذخیره محلی انجام می‌شود
+    except Exception:
         os.makedirs("cdn_storage", exist_ok=True)
         local_path = f"cdn_storage/{object_name}"
         with open(local_path, "wb") as buffer:
             buffer.write(file.file.read())
         video_url = f"/stream/{object_name}"
 
-    new_video = VideoModel(
+    new_video = VideoTable(
         id=video_id,
-        owner=owner,
+        owner_username=owner,
         url=video_url,
-        caption=caption
+        caption=caption,
+        likes_count=0
     )
-    db_videos[video_id] = new_video
-    return {"status": "success", "video": new_video}
+    db.add(new_video)
+    db.commit()
+    return {"status": "success", "video_id": video_id, "url": video_url}
 
 @app.get("/feed/for-you")
-def get_for_you_feed():
-    # الگوریتم پیشنهاد ویدیو بر اساس تعاملات (امتیاز لایک و بازدید)
-    for v_id, video in db_videos.items():
-        video.score = (len(video.likes) * 3) + (video.views * 0.5)
-        
-    sorted_videos = sorted(db_videos.values(), key=lambda x: x.score, reverse=True)
-    return sorted_videos
+def get_feed(db: Session = Depends(get_db)):
+    videos = db.query(VideoTable).order_by(VideoTable.likes_count.desc()).all()
+    return videos
 
-# --- ۳. تعاملات (لایک و کامنت) ---
 @app.post("/videos/like/{video_id}")
-def like_video(video_id: str, username: str):
-    if video_id not in db_videos:
+def like_video(video_id: str, db: Session = Depends(get_db)):
+    video = db.query(VideoTable).filter(VideoTable.id == video_id).first()
+    if not video:
         raise HTTPException(status_code=404, detail="ویدیو یافت نشد")
-    
-    video = db_videos[video_id]
-    if username in video.likes:
-        video.likes.remove(username)
-        return {"status": "unliked", "total_likes": len(video.likes)}
-    else:
-        video.likes.append(username)
-        return {"status": "liked", "total_likes": len(video.likes)}
+    video.likes_count += 1
+    db.commit()
+    return {"status": "success", "likes": video.likes_count}
 
 @app.post("/videos/comment")
-def add_comment(comment: CommentModel):
-    if comment.video_id not in db_videos:
-        raise HTTPException(status_code=404, detail="ویدیو یافت نشد")
-    
-    comment_data = {
-        "id": str(uuid.uuid4()),
-        "video_id": comment.video_id,
-        "username": comment.username,
-        "text": comment.text
-    }
-    db_comments.append(comment_data)
-    return {"status": "success", "comment": comment_data}
+def add_comment(comment: CommentCreate, db: Session = Depends(get_db)):
+    new_comment = CommentTable(
+        id=str(uuid.uuid4()),
+        video_id=comment.video_id,
+        username=comment.username,
+        text=comment.text
+    )
+    db.add(new_comment)
+    db.commit()
+    return {"status": "success"}
 
-# --- ۴. چت و پیام مستقیم (Direct Messages) ---
 @app.post("/chat/send")
-def send_message(msg: MessageModel):
-    db_messages.append(msg.dict())
-    return {"status": "sent"}
+def send_message(msg: MessageSend, db: Session = Depends(get_db)):
+    new_msg = MessageTable(
+        id=str(uuid.uuid4()),
+        sender=msg.sender,
+        receiver=msg.receiver,
+        text=msg.text
+    )
+    db.add(new_msg)
+    db.commit()
+    return {"status": "success"}
 
 @app.get("/chat/history")
-def get_chat_history(user1: str, user2: str):
-    chats = [
-        m for m in db_messages 
-        if (m["sender"] == user1 and m["receiver"] == user2) or (m["sender"] == user2 and m["receiver"] == user1)
-    ]
-    return chats
- {"status": "success", "user_id": new_user.id}
+def get_chat_history(user1: str, user2: str, db: Session = Depends(get_db)):
+    messages = db.query(MessageTable).filter(
+        ((MessageTable.sender == user1) & (MessageTable.receiver == user2)) |
+        ((MessageTable.sender == user2) & (MessageTable.receiver == user1))
+    ).all()
+    return messages
